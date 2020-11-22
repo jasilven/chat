@@ -7,48 +7,71 @@ use async_std::task;
 use std::collections::HashMap;
 use std::net::{SocketAddr, SocketAddrV4};
 
+use rand::distributions::Alphanumeric;
+use rand::Rng;
+
 #[derive(Debug, Clone)]
 struct Client {
-    nick: Option<String>,
+    nick: String,
     stream: TcpStream,
 }
 
 #[derive(Debug)]
-enum Message {
-    BroadcastMsg(SocketAddrV4, String),
-    PrivateMsg(SocketAddrV4, String),
-    ClientQuit(SocketAddrV4),
-    ClientNew(SocketAddrV4, Client),
-    NickChange(SocketAddrV4, String),
+enum Command {
+    MsgToAll(SocketAddrV4, String),
+    MsgToOne(SocketAddrV4, String),
+    Quit(SocketAddrV4),
+    New(SocketAddrV4, Client),
+    ChangeNick(SocketAddrV4, String),
     Users(SocketAddrV4),
+    Me(SocketAddrV4)
 }
 
 struct Server {
-    rx: Receiver<Message>,
+    rx: Receiver<Command>,
     clients: HashMap<SocketAddrV4, Client>,
 }
 
 impl Server {
-    fn new(rx: Receiver<Message>) -> Self {
+    fn new(rx: Receiver<Command>) -> Self {
         Server {
             rx,
             clients: HashMap::new(),
         }
     }
 
-    async fn broadcast(&mut self, addr: &SocketAddrV4, s: &str) {
-        let msg = s.trim();
+    fn random_nick(&self) -> Result<String> {
+        let mut limit = 10;
+        loop {
+            if limit == 0 {
+                anyhow::bail!("unable to generate nick");
+            }
+            let nick = rand::thread_rng()
+                .sample_iter(&Alphanumeric)
+                .take(6)
+                .collect::<String>();
+            if self.clients.iter().all(|(_, client)| client.nick != nick) {
+                return Ok(nick);
+            }
+            limit -= 1;
+        }
+    }
 
-        if let Some(nick) = self.clients.get(addr).and_then(|c| c.nick.as_ref()) {
-            eprintln!("{} says '{}'", nick, msg);
-            let line = format!("{}: {}\n", nick, msg);
+    async fn broadcast(&mut self, addr: &SocketAddrV4, is_admin: bool, s: &str) {
+        let time = chrono::Local::now().format("%H:%M:%S").to_string();
+        let msg = s.trim();
+        if let Some(client) = self.clients.get(addr) {
+            eprintln!("{} says '{}'", client.nick, msg);
+            let line = if is_admin {
+                format!("{} <{}>\n",time, msg )
+            } else {
+                format!("{} [{}]: {}\n",time, client.nick, msg)
+            };
             for (_, client) in self.clients.iter_mut().filter(|(a, _)| a.ne(&addr)) {
                 if let Err(e) = client.stream.write_all(line.as_bytes()).await {
                     eprintln!("broadcast error: {}", e);
                 }
             }
-        } else {
-            self.send_message(addr, "Cannot send messages as anonymous user. Use command '/nick' to select name for you.").await;
         }
     }
 
@@ -67,58 +90,87 @@ impl Server {
         }
     }
 
+    async fn change_nick(&mut self, addr: &SocketAddrV4, nick: &str) -> Result<String> {
+        if self
+            .clients
+            .iter()
+            .find(|(_, client)| client.nick == nick)
+            .is_some()
+        {
+            anyhow::bail!("Nick '{}' already present!", nick);
+        }
+        if let Some(client) = self.clients.get_mut(&addr) {
+            let old_nick = client.nick.clone();
+            client.nick = nick.to_string();
+            return Ok(old_nick);
+        } else {
+            anyhow::bail!("Cannot change nick.");
+        }
+    }
+
+    async fn new_client(&mut self, addr: SocketAddrV4, mut client: Client) -> Result<String> {
+        let nick = self.random_nick().unwrap_or("<anonymous>".to_string());
+        if !self.clients.contains_key(&addr) {
+            client.nick = nick.clone();
+            self.clients.insert(addr, client);
+            Ok(nick)
+        } else {
+            anyhow::bail!("Client '{}' already present!", addr);
+        }
+    }
+
     async fn run(&mut self) -> Result<()> {
         loop {
             match self.rx.recv().await? {
-                Message::ClientNew(addr, client) => {
+                Command::New(addr, client) => {
                     eprintln!("new client: {}", addr);
-                    if !self.clients.contains_key(&addr) {
-                        self.clients.insert(addr, client);
-                    } else {
-                        self.send_message(
-                            &addr,
-                            &format!("Client with id '{}' already present!", addr),
-                        )
-                        .await;
+                    match self.new_client(addr, client).await {
+                        Ok(nick) => {
+                            self.broadcast(&addr, true, &format!("{} joined", &nick))
+                                .await;
+                            self.send_message(&addr, &format!("Hello '{}'!", &nick))
+                                .await;
+                        }
+                        Err(e) => {
+                            self.send_message(&addr, &e.to_string()).await;
+                        }
                     }
                 }
-                Message::NickChange(addr, nick) => {
-                    if self
-                        .clients
-                        .iter()
-                        .find(|(_, client)| client.nick == Some(nick.clone()))
-                        .is_some()
-                    {
-                        self.send_message(&addr, &format!("nick '{}' already present!", &nick))
-                            .await;
-                    } else {
-                        let msg = if let Some(client) = self.clients.get_mut(&addr) {
-                            client.nick = Some(nick.clone());
-                            format!("you are now '{}'", &nick)
-                        } else {
-                            format!("cannot change your nick!")
-                        };
-                        self.send_message(&addr, &msg).await;
-                    };
+                Command::ChangeNick(addr, nick) => {
+                    match self.change_nick(&addr, &nick).await {
+                        Ok(old_nick) => {
+                            self.broadcast(&addr, true, &format!("{} is now {}", &old_nick, &nick))
+                                .await;
+                            self.send_message(&addr, &format!("You are now '{}'!", &nick))
+                                .await;
+                        },
+                        Err(e) => {
+                            self.send_message(&addr, &e.to_string()).await;
+                        }
+
+                    }
                 }
-                Message::ClientQuit(addr) => {
-                    self.broadcast(&addr, &format!("<left>")).await;
+                Command::Quit(addr) => {
+                    let nick = if let Some(client) = self.clients.get(&addr) {
+                        client.nick.clone() 
+                    } else {
+                        "<anonymous>".to_string()
+                    };
+                    self.broadcast(&addr, true, &format!("{} left", nick)).await;
                     self.clients.remove(&addr);
                 }
-                Message::BroadcastMsg(addr, s) => {
+                Command::MsgToAll(addr, s) => {
                     eprintln!("broadcasting: {}", &s);
-                    self.broadcast(&addr, &s).await;
+                    self.broadcast(&addr, false, &s).await;
                 }
-                Message::PrivateMsg(addr, s) => {
+                Command::MsgToOne(addr, s) => {
                     eprintln!("private: {}", &s);
                     self.send_message(&addr, &s).await;
                 }
-                Message::Users(addr) => {
+                Command::Users(addr) => {
                     let mut users = vec![];
                     self.clients.iter().for_each(|(_, c)| {
-                        if c.nick.is_some() {
-                            users.push(c.nick.clone().unwrap())
-                        }
+                        users.push(c.nick.clone());
                     });
                     self.send_message(
                         &addr,
@@ -130,60 +182,87 @@ impl Server {
                     )
                     .await;
                 }
+                Command::Me(addr) => {
+                    let nick = if let Some(client) = self.clients.get(&addr) {
+                        client.nick.clone() 
+                    } else {
+                        "<anonymous>".to_string()
+                    };
+                    self.send_message(
+                        &addr,
+                        &format!(
+                            "You are '{}' connected from '{}'",
+                            &nick,
+                           addr 
+                        ),
+                    )
+                    .await;
+                }
             }
         }
     }
 }
 
-async fn handle_client(stream: TcpStream, addr: SocketAddrV4, tx: Sender<Message>) -> Result<()> {
+async fn handle_client(stream: TcpStream, addr: SocketAddrV4, tx: Sender<Command>) -> Result<()> {
     eprintln!("connection from: {} ", &addr);
 
-    let mut client = Client {
-        nick: None,
+    let client = Client {
+        nick: "".to_string(),
         stream: stream.clone(),
     };
-    client.stream.write_all(b"hello").await?;
 
-    tx.send(Message::ClientNew(addr, client)).await;
+    tx.send(Command::New(addr, client)).await;
 
     let mut reader = BufReader::new(stream);
+    let mut buf = String::from("");
 
     loop {
-        let mut buf = String::from("");
-        if let Ok(0) = reader.read_line(&mut buf).await {
-            eprintln!("EOF from '{}'", addr);
-            tx.send(Message::ClientQuit(addr)).await;
-            break;
-        }
-
-        if let Some(cmd) = buf.split_ascii_whitespace().next() {
-            match cmd {
-                "/quit" => {
-                    tx.send(Message::ClientQuit(addr)).await;
-                    break;
-                }
-                "/nick" => {
-                    if let Some(nick) = buf.split_ascii_whitespace().skip(1).next() {
-                        tx.send(Message::NickChange(addr, nick.to_string())).await;
-                    }
-                }
-                "/users" => {
-                    tx.send(Message::Users(addr)).await;
-                }
-                _ => {
-                    if cmd.starts_with('/') {
-                        tx.send(Message::PrivateMsg(
-                            addr,
-                            format!("no such command '{}'", cmd),
-                        ))
-                        .await;
-                    } else {
-                        let line = buf.trim().to_string();
-                        tx.send(Message::BroadcastMsg(addr, line)).await;
+        match reader.read_line(&mut buf).await {
+            Ok(0) => {
+                tx.send(Command::Quit(addr)).await;
+                break;
+            }
+            Ok(_) => {
+                if let Some(cmd) = buf.split_ascii_whitespace().next() {
+                    match cmd {
+                        "/quit" => {
+                            tx.send(Command::Quit(addr)).await;
+                            break;
+                        }
+                        "/nick" => {
+                            if let Some(nick) = buf.split_ascii_whitespace().nth(1) {
+                                tx.send(Command::ChangeNick(addr, nick.to_string())).await;
+                            } else {
+                                tx.send(Command::Me(addr)).await;
+                            }
+                        }
+                        "/users" => {
+                            tx.send(Command::Users(addr)).await;
+                        }
+                        "/me" => {
+                            tx.send(Command::Me(addr)).await;
+                        }
+                        _ => {
+                            if cmd.starts_with('/') {
+                                tx.send(Command::MsgToOne(
+                                    addr,
+                                    format!("no such command '{}'", cmd),
+                                ))
+                                .await;
+                            } else {
+                                let line = buf.trim().to_string();
+                                tx.send(Command::MsgToAll(addr, line)).await;
+                            }
+                        }
                     }
                 }
             }
+            Err(e) => {
+                anyhow::bail!(e);
+            }
         }
+
+        buf.clear();
     }
 
     Ok(())
