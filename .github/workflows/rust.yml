@@ -18,3 +18,13 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: check
+      - name: Run cargo build
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release
+      - name: 'Upload Binary'
+        uses: actions/upload-artifact@v2
+        with:
+          name: chat
+          path: target/release/chat     
