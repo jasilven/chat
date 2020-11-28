@@ -24,7 +24,7 @@ enum Command {
     New(SocketAddrV4, Client),
     ChangeNick(SocketAddrV4, String),
     Users(SocketAddrV4),
-    Me(SocketAddrV4)
+    Me(SocketAddrV4),
 }
 
 struct Server {
@@ -63,9 +63,9 @@ impl Server {
         if let Some(client) = self.clients.get(addr) {
             eprintln!("{} says '{}'", client.nick, msg);
             let line = if is_admin {
-                format!("{} <{}>\n",time, msg )
+                format!("{} <{}>\n", time, msg)
             } else {
-                format!("{} [{}]: {}\n",time, client.nick, msg)
+                format!("{} [{}]: {}\n", time, client.nick, msg)
             };
             for (_, client) in self.clients.iter_mut().filter(|(a, _)| a.ne(&addr)) {
                 if let Err(e) = client.stream.write_all(line.as_bytes()).await {
@@ -136,23 +136,20 @@ impl Server {
                         }
                     }
                 }
-                Command::ChangeNick(addr, nick) => {
-                    match self.change_nick(&addr, &nick).await {
-                        Ok(old_nick) => {
-                            self.broadcast(&addr, true, &format!("{} is now {}", &old_nick, &nick))
-                                .await;
-                            self.send_message(&addr, &format!("You are now '{}'!", &nick))
-                                .await;
-                        },
-                        Err(e) => {
-                            self.send_message(&addr, &e.to_string()).await;
-                        }
-
+                Command::ChangeNick(addr, nick) => match self.change_nick(&addr, &nick).await {
+                    Ok(old_nick) => {
+                        self.broadcast(&addr, true, &format!("{} is now {}", &old_nick, &nick))
+                            .await;
+                        self.send_message(&addr, &format!("You are now '{}'!", &nick))
+                            .await;
                     }
-                }
+                    Err(e) => {
+                        self.send_message(&addr, &e.to_string()).await;
+                    }
+                },
                 Command::Quit(addr) => {
                     let nick = if let Some(client) = self.clients.get(&addr) {
-                        client.nick.clone() 
+                        client.nick.clone()
                     } else {
                         "<anonymous>".to_string()
                     };
@@ -184,17 +181,13 @@ impl Server {
                 }
                 Command::Me(addr) => {
                     let nick = if let Some(client) = self.clients.get(&addr) {
-                        client.nick.clone() 
+                        client.nick.clone()
                     } else {
                         "<anonymous>".to_string()
                     };
                     self.send_message(
                         &addr,
-                        &format!(
-                            "You are '{}' connected from '{}'",
-                            &nick,
-                           addr 
-                        ),
+                        &format!("You are '{}' connected from '{}'", &nick, addr),
                     )
                     .await;
                 }
@@ -206,6 +199,7 @@ impl Server {
 async fn handle_client(stream: TcpStream, addr: SocketAddrV4, tx: Sender<Command>) -> Result<()> {
     eprintln!("connection from: {} ", &addr);
 
+    // TODO: implement Client::new(stream)
     let client = Client {
         nick: "".to_string(),
         stream: stream.clone(),
