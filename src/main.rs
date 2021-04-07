@@ -1,8 +1,8 @@
 use anyhow::Result;
+use async_std::channel::{bounded, Receiver, Sender};
 use async_std::io::BufReader;
 use async_std::net::{TcpListener, TcpStream};
 use async_std::prelude::*;
-use async_std::sync::{channel, Receiver, Sender};
 use async_std::task;
 use std::collections::HashMap;
 use std::net::{SocketAddr, SocketAddrV4};
@@ -213,28 +213,28 @@ async fn handle_client(stream: TcpStream, addr: SocketAddrV4, tx: Sender<Command
     loop {
         match reader.read_line(&mut buf).await {
             Ok(0) => {
-                tx.send(Command::Quit(addr)).await;
+                tx.send(Command::Quit(addr)).await?;
                 break;
             }
             Ok(_) => {
                 if let Some(cmd) = buf.split_ascii_whitespace().next() {
                     match cmd {
                         "/quit" => {
-                            tx.send(Command::Quit(addr)).await;
+                            tx.send(Command::Quit(addr)).await?;
                             break;
                         }
                         "/nick" => {
                             if let Some(nick) = buf.split_ascii_whitespace().nth(1) {
-                                tx.send(Command::ChangeNick(addr, nick.to_string())).await;
+                                tx.send(Command::ChangeNick(addr, nick.to_string())).await?;
                             } else {
-                                tx.send(Command::Me(addr)).await;
+                                tx.send(Command::Me(addr)).await?;
                             }
                         }
                         "/users" => {
-                            tx.send(Command::Users(addr)).await;
+                            tx.send(Command::Users(addr)).await?;
                         }
                         "/me" => {
-                            tx.send(Command::Me(addr)).await;
+                            tx.send(Command::Me(addr)).await?;
                         }
                         _ => {
                             if cmd.starts_with('/') {
@@ -242,7 +242,7 @@ async fn handle_client(stream: TcpStream, addr: SocketAddrV4, tx: Sender<Command
                                     addr,
                                     format!("no such command '{}'", cmd),
                                 ))
-                                .await;
+                                .await?;
                             } else {
                                 let line = buf.trim().to_string();
                                 tx.send(Command::MsgToAll(addr, line)).await;
@@ -265,7 +265,7 @@ async fn handle_client(stream: TcpStream, addr: SocketAddrV4, tx: Sender<Command
 #[async_std::main]
 async fn main() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
-    let (tx, rx) = channel(100);
+    let (tx, rx) = bounded(100);
 
     task::spawn(async move {
         if let Err(e) = Server::new(rx).run().await {
